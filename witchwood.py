@@ -130,7 +130,7 @@ def read_fits(fitsfile, closefile=True):
     beams_per_pixel = beam_area / (abs(cd1*cd2) * numpy.log(2))
 
     if opened and closefile:
-        hdulise.close()
+        hdulist.close()
 
     return farray, warray, beams_per_pixel, cd1, cd2, hdulist
 
