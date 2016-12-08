@@ -13,7 +13,6 @@
 #
 # TODO:
 #    General speed improvement would be good. Not sure where to start with this.
-#    `flux_limit` function needs to be completed.
 #     Need to test on SUMSS postage stamps.
 # ------------------------------------------------------------------------------
 
@@ -44,17 +43,20 @@ def angular_distance(coords1, coords2):
     return gamma
 
 
-def read_fits(fitsfile, closefile=True):
+def read_fits(fitsfile=None, hdulist=None):
     '''Read a FITS file and return relevant data.'''
 
-    if isinstance(fitsfile, str):
-        hdulist = fits.open(fistfile)
-        opened = True  # To close it later on. 
-    elif isinstance(fitsfile, fits.HDUList):
+    if fitsfile is not None:
+        if not fitsfile.endswith('.fits'):
+            fitsfile += '.fits'
+        hdulist = fits.open(fitsfile)
+
+    elif hdulist is not None:
         hdulist = hdulist
-        opened = False
+
     else:
-        raise RuntimeError('Input filename must be a string or HDUList object.')
+        raise RuntimeError('To read a FITS file you must at least provide a '\
+            'FITS file.')
 
     harray = hdulist[0].header
     farray = hdulist[0].data
@@ -65,7 +67,7 @@ def read_fits(fitsfile, closefile=True):
     try:
         farray.shape = (harray['NAXIS2'], harray['NAXIS1'])
     except ValueError:
-        raise RuntimeError('FITS file must be flat.')
+        raise ValueError('FITS file must be flat.')
     # Find pixel sizes:
     try:
         cd1 = harray['CDELT1']     # Normal key for pixel size.
@@ -114,12 +116,11 @@ def read_fits(fitsfile, closefile=True):
                                 in hdulist[0].header['HISTORY'][i]:
                                 decl = input('Declination of source: ')
                                 decl = numpy.radians(abs(decl))
-                                beam_area = numpy.pi * (45.0**2 / 60.0**2) * \
+                                beam_area = numpy.pi * (45.0**2 / 3600.0**2) * \
                                     (1.0 / math.sin(decl))
                         if beam_area is None:
                             raise KeyError
                     except KeyError:
-                        # Input beam parameters manually. I don't like this.
                         beam_params = input('BEAM size (a, b) [deg]: ')
                         semi_a = 0.5 * beam_params[0]
                         semi_b = 0.5 * beam_params[1]
@@ -128,10 +129,7 @@ def read_fits(fitsfile, closefile=True):
     if beam_area is None:
         beam_area = (numpy.pi * semi_a * semi_b)
     beams_per_pixel = beam_area / (abs(cd1*cd2) * numpy.log(2))
-
-    if opened and closefile:
-        hdulist.close()
-
+    
     return farray, warray, beams_per_pixel, cd1, cd2, hdulist
 
 
@@ -302,8 +300,16 @@ def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=5
     if output is not None:
         start_time = datetime.now()
 
-    farray, warray, beams_per_pixel, cd1, cd2, hdulist = \
-        read_fits(fistfile=fitsfile, closefile=False)
+    if fitsfile is not None:
+        farray, warray, beams_per_pixel, cd1, cd2, hdulist = \
+            read_fits(fitsfile=fitsfile)
+    elif hdulist is not None:
+        farray, warray, beams_per_pixel, cd1, cd2, hdulist = \
+            read_fits(hdulist=hdulist)
+    else:
+        raise RuntimeError('Either a FITS file or HDUList object must be '\
+            'specified.')
+
     naxis = hdulist[0].header['NAXIS']
 
     farray, forest, tree_leaves, tree_fluxes, tree_coords, tree_bounds,\
@@ -366,7 +372,7 @@ def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=5
         # between any two pixels. This is optional as it takes significantly
         # longer than the rest of the script.
         # TODO: fix NAXS > 2 issue like below. 
-        if LAS:
+        if LAS and (naxis == 2):
             length = 0
             for pix_coord1 in range(0, len(tree_bounds[tree])):
                 ra1, dec1 = \
@@ -393,24 +399,31 @@ def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=5
 
     # Converting coordinates depends on number of axes of the FITS file.
     try:
-        if naxis == 2:
+        # if naxis == 2:
+        try:
             world_coords = warray.all_pix2world(source_centroid, 0)
             bright_coords = warray.all_pix2world(source_bcoord, 0)
-        else:
+        # else:
+        except ValueError:
             wx, wy, bx, by = [], [], [], []
             for i in range(0, len(source)):
                 wx.append(source_centroid[i][0])
                 wy.append(source_centroid[i][1])
                 bx.append(source_bcoord[i][0])
                 by.append(source_bcoord[i][1])
-            if naxis == 3:
+
+            # if naxis == 3:
+            try:
                 wc = warray.all_pix2world(wx, wy, numpy.ones_like(wx), 0)
                 bc = warray.all_pix2world(bx, by, numpy.ones_like(bx), 0)
-            elif naxis == 4:
-                wc = warray.all_pix2world(wx, wy, numpy.ones_like(wx), numpy.ones_like(wx), 0)
-                bc = warray.all_pix2world(bx, by, numpy.ones_like(bx), numpy.ones_like(bx), 0)
-            else:
-                raise ValueError('NAXIS size must be 2, 3, or 4.')
+            except ValueError:
+                try:
+            # elif naxis == 4:
+                    wc = warray.all_pix2world(wx, wy, numpy.ones_like(wx), numpy.ones_like(wx), 0)
+                    bc = warray.all_pix2world(bx, by, numpy.ones_like(bx), numpy.ones_like(bx), 0)
+            # else:
+                except ValueError:
+                    raise ValueError('NAXIS size must be 2, 3, or 4.')
             world_coords = []
             bright_coords = []
             for i in range(0, len(source)):
@@ -419,8 +432,8 @@ def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=5
     except TypeError:
         world_coords, bright_coords = [], []
         for i in range(0, len(source)):
-            world_coords.append('NA', 'NA')
-            bright_coords.append('NA', 'NA')
+            world_coords.append(('NA', 'NA'))
+            bright_coords.append(('NA', 'NA'))
 
     if output is not None:
         with open(output+'.txt', 'w+') as f:
@@ -544,12 +557,13 @@ def measure_tree(fitsfile, RA, DEC, rms, cutoff=3, max_pix=500, min_pix=2, \
     dist = angular_distance((RA, DEC), (world_coords[i][0], world_coords[i][1]))
 
     if verbose:
-        print '                Int. flux = {0}'.format(source_flux[i])
-        print '          Error int. flux = {0}'.format(source_dflux[i])
+        print '                Int. flux = {0} [Jy]'.format(source_flux[i])
+        print '          Error int. flux = {0} [Jy]'.format(source_dflux[i])
         print '               No. pixels = {0}'.format(source_npix[i])
         print 'Flux weighted coordinates = ({0}, {1})'.format(world_coords[i][0], \
             world_coords[i][1])
-        print '                      LAS = {0}'.format(source_LAS[i])
+        print '                      LAS = {0} [deg]'.format(source_LAS[i])
+        print '              Source area = {0} [deg^2]'.format(source_area[i])
         if dist < 1.0:
             dist_print = dist * 60.0
             dist_unit = 'arcmin'
@@ -561,21 +575,29 @@ def measure_tree(fitsfile, RA, DEC, rms, cutoff=3, max_pix=500, min_pix=2, \
             dist_unit = 'deg'
         print '        Offset from input = {0} [{1}]'.format(dist_print, \
             dist_unit)
-
-    if LAS:
-        return source[i], source_flux[i], source_dflux[i], source_avg_flux[i], \
-            source_area[i], source_npix[i], world_coords[i], bright_coords[i], \
-            source_LAS[i]
-    else:
-        return source[i], source_flux[i], source_dflux[i], source_avg_flux[i], \
-            source_area[i], source_npix[i], world_coords[i], bright_coords[i]
+        
+    return source[i], source_flux[i], source_dflux[i], source_avg_flux[i], \
+        source_area[i], source_npix[i], world_coords[i], bright_coords[i], \
+        source_LAS[i]
 
 
-def flux_limit(fitsfile, rms, area, reffile):
+def flux_limit(fitsfile, rms, area=None, reffile=None, refrms=None, \
+    refcoords=(None, None)):
     '''Get an upper limit on the flux density of a source.'''
+
+    if reffile is not None:
+        source = measure_tree(reffile, refcoords[0], refcoords[1], refrms, \
+            LAS=False, verbose=True)
+        area = source[4]
+    elif area is not None:
+        area = area
+    else:
+        raise ValueError('Either a source area of reference file must be given.')
+    print 'Area: {0}'.format(area)
 
     farray, warray, beams_per_pixel, cd1, cd2, hdulist = \
             read_fits(fitsfile=fitsfile)
+    hdulist.close()
     beam_area = beams_per_pixel * (abs(cd1*cd2) * numpy.log(2))
 
     rms_total = rms * (area / abs(cd1*cd2))
