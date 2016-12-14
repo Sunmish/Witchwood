@@ -580,28 +580,3 @@ def measure_tree(fitsfile, RA, DEC, rms, cutoff=3, max_pix=500, min_pix=2, \
         source_area[i], source_npix[i], world_coords[i], bright_coords[i], \
         source_LAS[i]
 
-
-def flux_limit(fitsfile, rms, area=None, reffile=None, refrms=None, \
-    refcoords=(None, None)):
-    '''Get an upper limit on the flux density of a source.'''
-
-    if reffile is not None:
-        source = measure_tree(reffile, refcoords[0], refcoords[1], refrms, \
-            LAS=False, verbose=True)
-        area = source[4]
-    elif area is not None:
-        area = area
-    else:
-        raise ValueError('Either a source area of reference file must be given.')
-    print 'Area: {0}'.format(area)
-
-    farray, warray, beams_per_pixel, cd1, cd2, hdulist = \
-            read_fits(fitsfile=fitsfile)
-    hdulist.close()
-    beam_area = beams_per_pixel * (abs(cd1*cd2) * numpy.log(2))
-
-    rms_total = rms * (area / abs(cd1*cd2))
-
-    flux_lim = rms_total / beams_per_pixel
-
-    return flux_lim
