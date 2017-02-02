@@ -32,13 +32,16 @@ from astropy import units as u            # For cross-referencing.
 def angular_distance(coords1, coords2):
     '''Get the angular distance between a set of RA, DEC coordinates in [dd].'''
 
-    gamma = math.degrees(math.acos(\
-        math.cos(math.radians(90.0 - coords1[1])) * \
-        math.cos(math.radians(90.0 - coords2[1])) + \
-        math.sin(math.radians(90.0 - coords1[1])) * \
-        math.sin(math.radians(90.0 - coords2[1])) * \
-        math.cos(math.radians(coords1[0] - coords2[0]))
-        ))
+    cos_angle = math.sin(math.radians(coords1[1])) * \
+            math.sin(math.radians(coords2[1])) + \
+            math.cos(math.radians(coords1[1])) * \
+            math.cos(math.radians(coords2[1])) * \
+            math.cos(math.radians(coords1[0] - coords2[0]))
+
+    try:
+        gamma = math.degrees(math.acos(cos_angle))
+    except ValueError:
+        gamma = math.degrees(math.acos(min(1, max(cos_angle, -1))))
 
     return gamma
 
@@ -142,9 +145,9 @@ class Tree():
 
     def __init__(self, tree_number, threshold):
         '''"The seed of a tree of giants."'''
-        self.no = tree_number  # The source ID.
-        self.th = threshold    # Threshold needed for detection.
-
+        self.no = tree_number     # The source ID.
+        self.th = threshold[0]    # Threshold needed for detection.
+        self.gh = threshold[1]    # Growing threshold.
 
     def seedling(self, m, n, farray, warray, forest, diagonals):
         '''Start from a seedling and grow a tree.'''
@@ -177,7 +180,7 @@ class Tree():
                     else:
                         try:
                             if (numpy.isnan(forest[index])) and \
-                                (farray[index] >= self.th):
+                                (farray[index] >= self.gh):
                                 self.leaves += 1
                                 self.fluxes = numpy.append(self.fluxes, \
                                     farray[index])
@@ -227,6 +230,7 @@ def populate_forest(farray, warray, threshold, max_pix, min_pix, diagonals):
     tree_coords = {tree_number: 0}  # its pixel coordinates,
     tree_bounds = {tree_number: 0}  # its boundary coordinates,
     tree_bright = {tree_number: 0}  # Source brightest pixel coordinates.
+    tree_height = {tree_number: 0}
 
     for n in range(0, len(farray[0, :])):
         for m in range(0, len(farray[:, 0])):
@@ -245,17 +249,18 @@ def populate_forest(farray, warray, threshold, max_pix, min_pix, diagonals):
                         tree_coords[tree_number-1] = t.coords
                         tree_bounds[tree_number-1] = t.bounds
                         tree_bright[tree_number-1] = t.bcoord
+                        tree_height[tree_number-1] = t.bright
 
                     else:
                         pass
                 except AttributeError:
                     pass
     return farray, forest, tree_leaves, tree_fluxes, tree_coords, tree_bounds, \
-        tree_bright
+        tree_bright, tree_height
 
 
-def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=500, \
-    min_pix=2, diagonals=True, LAS=True, output=None, annotations='ds9', \
+def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff1=None, cutoff2=None, \
+    max_pix=500, min_pix=2, diagonals=True, LAS=True, output=None, annotations='ds9', \
     verbose=True):
     '''Calculate the fluxes of individual sources within a FITS file.
 
@@ -267,8 +272,10 @@ def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=5
                 Can be specified in place of a FITS file.
     rms         : float
                 rms of the image. Minimum detection threshold is `rms` * `cutoff`.
-    cutoff      : int, optional
+    cutoff1     : int, optional
                 The multiple of `rms` needed for a detection. Default is 3sigma.
+    cutoff2     : int, optional
+                The multiple of `rms` needed for growing sources. Default is `cutoff1`.
     max_pix     : int, optional
                 Maximum number of pixels in a detection. Useful only to save
                 time ignoring large sources (e.g., Fornax A) as LAS calculations
@@ -293,9 +300,13 @@ def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=5
 
     if rms is None:
         raise ValueError('RMS must be specified.')
-    if cutoff is None:
-        cutoff = 3
-    threshold = cutoff * rms
+    if cutoff1 is None:
+        cutoff1 = 3
+    if cutoff2 is None:
+        cutoff2 = cutoff1
+
+    threshold1 = cutoff1 * rms
+    threshold2 = cutoff2 * rms
 
     if output is not None:
         start_time = datetime.now()
@@ -313,12 +324,13 @@ def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=5
     naxis = hdulist[0].header['NAXIS']
 
     farray, forest, tree_leaves, tree_fluxes, tree_coords, tree_bounds,\
-        tree_bright = populate_forest(farray=farray, warray=warray, \
-        threshold=threshold, max_pix=max_pix, min_pix=min_pix, \
+        tree_bright, tree_height = populate_forest(farray=farray, warray=warray, \
+        threshold=(threshold1, threshold2), max_pix=max_pix, min_pix=min_pix, \
         diagonals=diagonals)
 
     source_flux = []
     source_dflux = []
+    source_peak = []
     source_centroid = []
     source_avg_flux = []
     source_bcoord = []
@@ -327,9 +339,10 @@ def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=5
     source_LAS = []
     source = []
 
+
     if (len(tree_leaves) == 1) and (tree_leaves[1] == 0):
         raise ValueError('No sources detected for {0} with threshold = '\
-                '{1}'.format(fitsfile, threshold))
+                '{1}'.format(fitsfile, threshold1))
 
     zero_flag = False
     if tree_leaves[1] == 0:
@@ -339,6 +352,7 @@ def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=5
         del tree_coords[1]
         del tree_bounds[1]
         del tree_bright[1]
+        del tree_height[1]
 
     for tree in tree_leaves:
 
@@ -349,6 +363,7 @@ def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=5
             source_avg_flux.append(sum(tree_fluxes[tree]) / tree_leaves[tree])
             source_area.append(abs(cd1*cd2) * tree_leaves[tree])
             source_npix.append(tree_leaves[tree])
+            source_peak.append(tree_height[tree])
             try:
                 source_bcoord.append((tree_bright[tree][0][1], \
                     tree_bright[tree][0][0]))
@@ -399,12 +414,12 @@ def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=5
 
     # Converting coordinates depends on number of axes of the FITS file.
     try:
-        # if naxis == 2:
-        try:
+        if naxis == 2:
+        # try:
             world_coords = warray.all_pix2world(source_centroid, 0)
             bright_coords = warray.all_pix2world(source_bcoord, 0)
-        # else:
-        except ValueError:
+        else:
+        # except ValueError:
             wx, wy, bx, by = [], [], [], []
             for i in range(0, len(source)):
                 wx.append(source_centroid[i][0])
@@ -412,28 +427,31 @@ def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=5
                 bx.append(source_bcoord[i][0])
                 by.append(source_bcoord[i][1])
 
-            # if naxis == 3:
-            try:
+            if naxis == 3:
+            # try:
                 wc = warray.all_pix2world(wx, wy, numpy.ones_like(wx), 0)
                 bc = warray.all_pix2world(bx, by, numpy.ones_like(bx), 0)
-            except ValueError:
-                try:
-            # elif naxis == 4:
+            # except ValueError:
+                # try:
+            elif naxis == 4:
                     wc = warray.all_pix2world(wx, wy, numpy.ones_like(wx), numpy.ones_like(wx), 0)
                     bc = warray.all_pix2world(bx, by, numpy.ones_like(bx), numpy.ones_like(bx), 0)
-            # else:
-                except ValueError:
-                    raise ValueError('NAXIS size must be 2, 3, or 4.')
+            else:
+                # except ValueError:
+                raise ValueError('NAXIS size must be 2, 3, or 4.')
             world_coords = []
             bright_coords = []
             for i in range(0, len(source)):
                 world_coords.append([wc[0][i], wc[1][i]])
                 bright_coords.append([bc[0][i], bc[1][i]])
+
     except TypeError:
-        world_coords, bright_coords = [], []
-        for i in range(0, len(source)):
-            world_coords.append(('NA', 'NA'))
-            bright_coords.append(('NA', 'NA'))
+        # world_coords, bright_coords = [], []
+        # for i in range(0, len(source)):
+        #     world_coords.append(('NA', 'NA'))
+        #     bright_coords.append(('NA', 'NA'))
+        raise
+
 
     if output is not None:
         with open(output+'.txt', 'w+') as f:
@@ -442,7 +460,7 @@ def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=5
             f.write('# \n')
             f.write('# ............ Input FITS = {0}\n'.format(fitsfile))
             f.write('# ................ Output = {0}\n'.format(output))
-            f.write('# ............. Threshold = {0}\n'.format(threshold))
+            f.write('# ............. Threshold = {0}\n'.format(threshold1))
             f.write('# ........ Minimum pixels = {0}\n'.format(min_pix))
             f.write('# ........ Maximum pixels = {0}\n'.format(max_pix))
             f.write('# Total number of sources = {0}\n'.format(len(source)))
@@ -502,10 +520,10 @@ def measure_forest(fitsfile=None, hdulist=None, rms=None, cutoff=None, max_pix=5
         hdulist.writeto(output+'_forest.fits')
 
     return source, source_flux, source_dflux, source_avg_flux, source_area, \
-        source_npix, world_coords, bright_coords, source_LAS
+        source_npix, world_coords, bright_coords, source_LAS, source_peak
 
 
-def measure_tree(fitsfile, RA, DEC, rms, cutoff=3, max_pix=500, min_pix=2, \
+def measure_tree(fitsfile, RA, DEC, rms, cutoff1=3, cutoff2=None, max_pix=500, min_pix=2, \
     diagonals=True, LAS=True, annotations='ds9', output=None, verbose=False):
     '''Measure the flux/length of a single source.
 
@@ -518,8 +536,8 @@ def measure_tree(fitsfile, RA, DEC, rms, cutoff=3, max_pix=500, min_pix=2, \
     DEC       : string or float
               Declination of source to be measured.
     rms       : float
-              rms of the image. Minimum detection threshold is `rms` * `cutoff`.
-    cutoff    : int, optional
+              rms of the image. Minimum detection threshold is `rms` * `cutoff1`.
+    cutoff1    : int, optional
               The multiple of `rms` needed for a detection. Default is 3sigma.
     max_pix   : int, optional
               Maximum number of pixels in a detection. Useful only to save
@@ -543,9 +561,9 @@ def measure_tree(fitsfile, RA, DEC, rms, cutoff=3, max_pix=500, min_pix=2, \
 
     # A forest in which our tree resides.
     source, source_flux, source_dflux, source_avg_flux, source_area, \
-        source_npix, world_coords, bright_coords, source_LAS = \
-        measure_forest(fitsfile=fitsfile, rms=rms, cutoff=cutoff, \
-        max_pix=max_pix, min_pix=min_pix, diagonals=diagonals, LAS=LAS, \
+        source_npix, world_coords, bright_coords, source_LAS, source_peak = \
+        measure_forest(fitsfile=fitsfile, rms=rms, cutoff1=cutoff1, \
+        cutoff2=cutoff2, max_pix=max_pix, min_pix=min_pix, diagonals=diagonals, LAS=LAS, \
         output=output, verbose=False, annotations=annotations)
 
     # Now to find the tree:
@@ -559,6 +577,7 @@ def measure_tree(fitsfile, RA, DEC, rms, cutoff=3, max_pix=500, min_pix=2, \
     if verbose:
         print '                Int. flux = {0} [Jy]'.format(source_flux[i])
         print '          Error int. flux = {0} [Jy]'.format(source_dflux[i])
+        print '                Peak flux = {0} [Jy/beam]'.format(source_peak[i])
         print '               No. pixels = {0}'.format(source_npix[i])
         print 'Flux weighted coordinates = ({0}, {1})'.format(world_coords[i][0], \
             world_coords[i][1])
@@ -578,5 +597,134 @@ def measure_tree(fitsfile, RA, DEC, rms, cutoff=3, max_pix=500, min_pix=2, \
         
     return source[i], source_flux[i], source_dflux[i], source_avg_flux[i], \
         source_area[i], source_npix[i], world_coords[i], bright_coords[i], \
-        source_LAS[i]
+        source_LAS[i], source_peak[i]
 
+
+
+def force_measure_tree(fitsfile, RA, DEC, radius, rms, cutoff=3, LAS=True, \
+                       verbose=False, radius_units='deg'):
+    '''Measure flux within an aperture. 
+
+    This can sum flux above a threshold or simply sum flux below a threshold
+    to get a a limit.
+
+    Parameters
+    ----------
+    fitsfile     : string or astropy.io.fits.HDUList
+                   If string this should be the filename and path to a FITS file.
+    RA           : float
+                   Central RA in decimal degrees.
+    DEC          : float
+                   Central DEC in decimal degrees.
+    radius       : float
+                   Aperture within which to calculate flux in degree.
+    rms          : float
+                   Average RMS of the map.
+    cutoff       : int, optional
+                   Multiple of the RMS required for detection. Default is 3.
+    LAS          : bool, optional
+                   If True an LAS is calculated.
+    verbose      : bool, optional
+                   If True results are printed to the terminal.
+    radius_units : {'deg', 'arcmin', 'arcsec'}, optional
+                   Specifies the unit for `radius`.
+
+    Returns
+    -------
+    int_flux     : float
+                   The integrated flux density within the aperture of `radius` 
+                   in Jansky.
+    unc_flux     : float
+                   The uncertainty in the integrated flux density.
+    npix         : int
+                   The number of pixels that were above `cutoff`*`rms`.
+    area         : float
+                   The area in degrees squared of the pixels above `cutoff`*`rms`.
+    las          : float or string
+                   If `LAS` is True, then the `las` is returned in degrees. If not,
+                   the `las` returned is the string "NA".
+
+    '''
+
+    if isinstance(fitsfile, str):
+        hdulist = fits.open(fitsfile)
+        opened  = True
+    elif isinstance(fitsfile, fits.HDUList):
+        hdulist = fitsfile
+        opened  = False
+    else:
+        raise TypeError('>>> Input file must be `pathtofile/file` or an' \
+                        'astropy.io.fits.HDUList object.')
+
+    farray, warray, beams_per_pixel, cd1, cd2, hdulist = \
+        read_fits(hdulist=hdulist)
+    naxis = hdulist[0].header['NAXIS']
+
+    if radius_units == 'deg':
+        radius_units = 1.0
+    elif radius_units == 'arcmin':
+        radius_units = 60.0
+    elif radius_units == 'arcsec':
+        radius_units = 3600.0
+    else:
+        raise TypeError('>>> `radius_units` must be one of [`deg`, '\
+                        '`arcmin`, `arcsec`].')
+
+    source_flux, source_xpixel, source_ypixel, source_coords = [], [], [], []
+
+    for i in range(0, len(farray[:, 0])):
+        for j in range(0, len(farray[0, :])):
+
+            if farray[i, j] >= cutoff*rms:
+
+                if naxis == 2:
+                    coords = warray.all_pix2world(j, i, 0)
+                elif naxis == 3:
+                    coords = warray.all_pix2world(j, i, 1, 0)
+                elif naxis == 4:
+                    coords = warray.all_pix2world(j, i, 1, 1, 0)
+                else:
+                    raise ValueError('>>> NAXIS must be 2, 3, or 4.')
+
+                diff = angular_distance((RA, DEC), (coords[0], coords[1]))
+
+                if diff <= (radius/radius_units):
+
+                    source_flux.append(farray[i, j])
+                    source_xpixel.append(i)
+                    source_ypixel.append(j)
+                    source_coords.append(coords)
+
+    int_flux = sum(source_flux) / beams_per_pixel
+    unc_flux = rms * numpy.sqrt(len(source_flux) / beams_per_pixel)
+    area     = len(source_flux) * abs(cd1*cd2)
+    npix     = len(source_flux)
+
+    if LAS:
+
+        las = 0
+
+        for i in range(0, len(source_coords)):
+            for j in range(0, len(source_coords)):
+
+                if angular_distance(source_coords[i], source_coords[j]) > las:
+
+                    las = angular_distance(source_coords[i], source_coords[j])
+
+    else:
+
+        las = 'NA'
+
+    if verbose:
+
+        print('>>> WITCHWOOD has calculated the following parameters:')
+        print('Integrated flux  = %f [Jy]' % int_flux)
+        print('Error int. flux  = %f [Jy]' % unc_flux)
+        print('Number of pixels = %i' % npix)
+        print('Source area      = %f [deg^2]' % area)
+        if LAS:
+            print('Source LAS       = %f [deg]' % las)
+        else:
+            print('No LAS has been found.')
+
+    return int_flux, unc_flux, npix, area, las
