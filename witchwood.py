@@ -10,10 +10,15 @@
 #   TGSS
 #   VLSSr
 #   GLEAM
+# 
+# Exciting new features!
+# - Measure flux in a circular aperture!
+# - Measure flux in a polygon defined by some number of vertices! (N_vertices > 3)
+#
 #
 # TODO:
 #    General speed improvement would be good. Not sure where to start with this.
-#     Need to test on SUMSS postage stamps.
+#    Need to test on SUMSS postage stamps.
 # ------------------------------------------------------------------------------
 
 
@@ -47,7 +52,12 @@ def angular_distance(coords1, coords2):
 
 
 def read_fits(fitsfile=None, hdulist=None):
-    '''Read a FITS file and return relevant data.'''
+    '''Read a FITS file and return relevant data.
+
+    Because the FITS standard is in fact not completely standard there a few 
+    little things that need to be checked to looked for the necessary header 
+    data.
+    '''
 
     if fitsfile is not None:
         if not fitsfile.endswith('.fits'):
@@ -728,3 +738,336 @@ def force_measure_tree(fitsfile, RA, DEC, radius, rms, cutoff=3, LAS=True, \
             print('No LAS has been found.')
 
     return int_flux, unc_flux, npix, area, las
+
+
+
+def force_measure_ellipse(fitsfile, RA, DEC, rms, a, b, pa=0.0, cutoff=3, \
+                          verbose=True, units="deg"):
+    """Measure flux within an elliptical aperture."""
+
+
+    if isinstance(fitsfile, str):
+        hdulist = fits.open(fitsfile)
+        opened  = True
+    elif isinstance(fitsfile, fits.HDUList):
+        hdulist = fitsfile
+        opened  = False
+    else:
+        raise TypeError('>>> Input file must be `pathtofile/file` or an' \
+                        'astropy.io.fits.HDUList object.')
+
+
+    farray, warray, beams_per_pixel, cd1, cd2, hdulist = \
+        read_fits(hdulist=hdulist)
+    naxis = hdulist[0].header['NAXIS']
+
+    if units == 'deg':
+        radius_units = 1.0
+    elif units == 'arcmin':
+        radius_units = 60.0
+    elif units == 'arcsec':
+        radius_units = 3600.0
+    else:
+        raise TypeError('>>> `radius_units` must be one of [`deg`, '\
+                        '`arcmin`, `arcsec`].')
+
+    source_flux, source_xpixel, source_ypixel, source_coords = [], [], [], []
+
+
+    for i in range(len(farray[:, 0])):
+        for j in range(len(farray[0, :])):
+
+            # if farray[i, j] >= cutoff*rms:
+
+            if naxis == 2:
+                coords = warray.all_pix2world(j, i, 0)
+            elif naxis == 3:
+                coords = warray.all_pix2world(j, i, 1, 0)
+            elif naxis == 4:
+                coords = warray.all_pix2world(j, i, 1, 1, 0)
+            else:
+                raise ValueError('>>> NAXIS must be 2, 3, or 4.')
+
+            gamma = angular_distance((RA, DEC), (coords[0], coords[1]))
+            phi   = numpy.cos(numpy.radians(gamma/coords[1]))
+            if coords[1] < DEC:
+                theta = phi
+            elif coords[1] >= DEC:
+                theta = 180.0 - phi
+            theta = theta
+
+            r = a*b / (numpy.sqrt(b**2 * (math.cos(math.radians(theta)))**2 + \
+                a**2 * (math.sin(math.radians(theta)))**2))
+
+            if gamma <= r:
+
+                source_flux.append(farray[i, j])
+                source_xpixel.append(i)
+                source_ypixel.append(j)
+                source_coords.append(coords)
+
+            else:
+                hdulist[0].data[i, j] = numpy.nan
+            # else:
+            #     # hdulist[0].data[i, j] = numpy.nan
+
+    int_flux = sum(source_flux) / beams_per_pixel
+    unc_flux = rms * numpy.sqrt(len(source_flux) / beams_per_pixel)
+    area     = len(source_flux) * abs(cd1*cd2)
+    npix     = len(source_flux)
+
+    if verbose:
+
+        print('>>> WITCHWOOD has calculated the following parameters:')
+        print('Integrated flux  = %f [Jy]' % int_flux)
+        print('Error int. flux  = %f [Jy]' % unc_flux)
+        print('Number of pixels = %i' % npix)
+        print('Source area      = %f [deg^2]' % area)
+
+    hdulist.writeto("test.fits")
+
+    return int_flux, unc_flux, npix, area
+
+
+
+def region_flux(fitsfile, region, rms, r_index=0, sigma=2.6, out_ann=None, \
+                out_ann_color="yellow", verbose=False):
+    """Measure flux within region specified by DS9 region file.
+
+    This does what `radioflux.py` does; written by M.~J. Hardcastle:
+    http://www.extragalactic.info/~mjh/radio-flux.html
+
+    This adapts a C++ implementation found here:
+    http://www.geeksforgeeks.org/how-to-check-if-a-given-point-lies-inside-a-polygon/
+
+
+    Note that region vetices must be ordered.
+    
+    Parameters
+    ----------
+    fitsfile
+    region  
+    rms
+    r_index
+    sigma
+    out_ann
+    """
+
+    def orientation(p1, p2, p3):
+        """Get orientation of ordered triplet. 
+        
+        0 == collinear
+        1 == clockwise
+        2 == counter-clockwise
+        """
+
+        slop = (p2[1] - p1[1]) * (p3[0] - p2[0]) - \
+               (p3[1] - p2[1]) * (p2[0] - p1[0])
+
+        if slop < 0:
+            orient = 2
+        elif slop > 0:
+            orient = 1
+        else:
+            orient = 0
+
+        return orient
+
+
+    def intersects(p1, q1, p2, q2):
+        """Determine if line segment (p1, q1) intersects with (p2, q2)
+
+        Uses orientation conditions.
+        """
+
+        def on_segment(p1, p2, p3):
+            """Checks if p3 lies on segment (p1, p2)."""
+
+            if ((p3[0] <= max(p1[0], p2[0])) and (p3[0] >= min(p1[0], p2[0])) and\
+                (p3[2] <= max(p1[1], p2[1])) and (p3[1] >= min(p1[1], p2[1]))):
+
+                return True
+
+            else:
+
+                return False
+
+
+        inter = False
+
+
+        # General case:
+        if (orientation(p1, q1, p2) != orientation(p1, q1, q2)) and \
+           (orientation(p2, q2, p1) != orientation(p2, q2, q1)):
+
+           inter = True
+
+        # Special cases:
+        if (orientation(p1, q1, p2) == 0) and (on_segment(p1, q1, p2)):
+            inter = True
+        if (orientation(p1, q1, q2) == 0) and (on_segment(p1, q1, q2)):
+            inter = True
+        if (orientation(p2, q2, p1) == 0) and (on_segment(p2, q2, p1)):
+            inter = True
+        if (orientation(p2, q2, q1) == 0) and (on_segment(p2, q2, q1)):
+            inter = True
+
+
+        return inter
+
+
+
+    def is_in(x, y, region_x, region_y, max_x):
+        """Check if (x, y) is in region.
+
+        (x, y) is considered in region if the followed is met:
+        A line drawn horizontally to the right from (x, y) intersects 
+        with an odd number of region edges. 
+        """  
+        
+        coords_in_region = []
+
+        for i in range(len(x)):
+
+            p1, q1 = (x[i], y[i]), (x[i]+max_x, y[i])
+
+            intersections = 0
+
+            for j in range(len(region_x)):
+                p2 = (region_x[j], region_y[j])
+                if j == len(region_x)-1:
+                    q2 = (region_x[0], region_y[0])
+                else:
+                    q2 = (region_x[j+1], region_y[j+1])
+
+                if intersects(p1, q1, p2, q2):
+                    intersections += 1
+
+            if intersections%2 == 0:
+                in_region = False
+            else:
+                in_region = True
+
+
+            coords_in_region.append(in_region)
+
+        return coords_in_region
+
+
+    import pyregion
+
+    if region.endswith(".reg"):
+        # This is a ds9 region file, so will use pyregion for parsing.
+        r = pyregion.open(region)[r_index].coord_list
+        print r
+
+        coords = []
+        ra, dec = [], []
+        for i in range(0, len(r), 2):
+            print r[i]
+            coords.append((r[i], r[i+1]))
+            ra.append(r[i])
+            dec.append(r[i+1])
+            
+    elif region.endswith(".ann"):
+        raise ValueError("No support for Kvis annotation files currently.")
+
+    else:
+        # Assume region is a list of coordinate tuples.
+        coords = region
+        ra, dec = [], []
+        for vertex in region:
+            ra.append(vertex[0])
+            dec.append(vertex[1])
+
+    farray, warray, beams_per_pixel, cd1, cd2, hdulist = \
+        read_fits(fitsfile)
+    max_x = len(hdulist[0].data[:, 0]+1)
+    
+    if isinstance(rms, str): 
+        rms_image = fits.getdata(rms)
+        opened = True
+    elif isinstance(rms, fits.HDUList): 
+        rms_image =rms[0].data
+        opened  = False
+    else: 
+        rms_image = None
+        opened = False
+
+    if opened:
+        print("An rms image has been opened.")
+        
+        
+    if rms_image is not None:
+        # if (len(rms_image[:, 0]) != len(farray[:, 0])) or \
+        #    (len(rms_image[0, :]) != len(farray[0, :])):
+        if rms_image.shape != farray.shape:
+            raise ValueError("Primary and rms images are different sizes.")
+
+
+    pix_d, pix_r = warray.all_world2pix(ra, dec, 0)
+    x_all, y_all, f_all, r_all = [], [], [], []
+    for i in range(0, len(hdulist[0].data[:, 0])):
+        for j in range(0, len(hdulist[0].data[0, :])):
+
+            x_all.append(i)
+            y_all.append(j)
+            f_all.append(hdulist[0].data[i, j])
+            if rms_image is not None:
+                r_all.append(rms_image[i, j])
+    
+
+
+    cir = is_in(x_all, y_all, pix_r, pix_d, max_x)
+
+
+    tree_fluxes = []
+    tree_rmses  = []
+
+    print tree_rmses
+
+    final_ra, final_dec = [], []
+
+
+    for i in range(len(cir)):
+        if rms is not None:
+            if rms_image is not None: r = r_all[i]
+            else: r = rms
+            if cir[i] and (f_all[i] >= sigma*r):
+                print r
+                tree_fluxes.append(f_all[i])
+                tree_rmses.append(r)
+                xx, yy = warray.all_pix2world(y_all[i], x_all[i], 0)
+                final_ra.append(xx), final_dec.append(yy)
+        else:
+            if cir[i]:
+                tree_fluxes.append(f_all[i])
+                xx, yy = warray.all_pix2world(y_all[i], x_all[i], 0)
+                final_ra.append(xx), final_dec.append(yy)
+
+    print tree_rmses
+    
+    if out_ann is not None:
+        if out_ann.endswith(".ann"):
+            with open(out_ann, "w+") as g:
+                g.write("COLOUR {0}\n".format(out_ann_color))
+                for i in range(len(final_ra)):
+                    g.write("DOT W {0} {1}\n".format(final_ra[i], final_y[i]))
+
+    source_flux  = sum(tree_fluxes) / beams_per_pixel
+    if rms is not None:
+        source_dflux = (sum(tree_rmses) / beams_per_pixel) * \
+                        numpy.sqrt(beams_per_pixel / float(len(tree_fluxes)))
+    else:
+        rms = numpy.nan
+
+    if verbose:
+
+        print(">>> WITCHWOOD has calculated the following parameters:")
+        print("Integrated flux  = {0} [Jy]".format(source_flux))
+        print("Error int. flux  = {0} [Jy]".format(source_dflux))
+        print("Number of pixels = {0}".format(len(tree_fluxes)))
+
+
+    return source_flux, source_dflux, tree_fluxes
+
